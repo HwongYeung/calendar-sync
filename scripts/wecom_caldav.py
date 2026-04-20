@@ -5,6 +5,9 @@ Supports: list-calendars, query, create, delete operations
 against the WeChat Work CalDAV server (caldav.wecom.work).
 
 Config is stored in ~/.openclaw/extensions/wecom-caldav/config.json
+
+Author: muskhuang
+Repository: https://git.woa.com/muskhuang/wecom-caldav
 """
 
 import argparse

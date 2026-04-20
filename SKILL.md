@@ -1,5 +1,7 @@
 ---
 name: wecom-caldav
+author: muskhuang
+repository: https://git.woa.com/muskhuang/wecom-caldav
 description: 企业微信日历管理技能，通过 CalDAV 协议查询、创建、删除企微日程。采用本地缓存 + 后台定时同步架构，查询毫秒级响应。当用户需要查看企微日程、创建日程、删除日程、查询本周/今日/下周日程、同步企微日历时触发。首次使用需配置 CalDAV 凭证并安装后台同步任务（setup + daemon-install）。替代不可用的 wecom_mcp 日程接口。支持 RRULE 重复事件展开、EXDATE 排除日期、全量扫描模式（绕过企微 CalDAV 服务器的 time-range 过滤 bug）。
 ---
 

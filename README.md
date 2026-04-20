@@ -1,5 +1,8 @@
 # wecom-caldav
 
+> **Author**: muskhuang
+> **Repository**: https://git.woa.com/muskhuang/wecom-caldav
+
 企业微信 CalDAV 日程管理 skill，通过 CalDAV 协议直连企业微信日历服务器，采用 **本地缓存 + cron 后台定时同步** 架构，查询响应时间从 ~40 秒降到 ~0.1 秒。
 
 > 本 skill 是 `wecom_mcp schedule` 的替代方案，当 MCP 连接不可用时使用。
