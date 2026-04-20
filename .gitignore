@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Runtime / cache
+cache/
+*.log
+*.lock
+*.pid
+
+# CalDAV credentials (NEVER commit)
+config.json
+.openclaw/
+secrets.*
+*.secret
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Backups
+*.bak
+*.bak.*
+.backup/
