@@ -2,7 +2,7 @@
   "id": "wecom-caldav",
   "name": "WeCom CalDAV",
   "description": "企业微信日历管理 (CalDAV + 本地缓存 + cron 后台同步)",
-  "skills": ["./skills"],
+  "skills": ["."],
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

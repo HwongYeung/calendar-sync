@@ -79,20 +79,18 @@ pip install caldav python-dateutil
 
 ## 文件结构
 
-本仓库是一个符合 **Openclaw extension 规范** 的插件包：
+本仓库采用 **扁平结构**，既是一个 skill 包（根目录有 SKILL.md），也是一个 Openclaw extension 包（根目录有 openclaw.plugin.json）：
 
 ```
-wecom-caldav/                       # Openclaw extension 包根目录
-├── openclaw.plugin.json            # 插件清单（声明 id/skills 等）
-├── README.md                       # 本文档
+wecom-caldav/
+├── SKILL.md                   # 技能说明（Agent / skill installer 读取）
+├── openclaw.plugin.json       # Openclaw 插件清单（skills 指向 "."）
+├── README.md                  # 本文档
 ├── .gitignore
-└── skills/
-    └── wecom-caldav/               # 内含一个 skill: wecom-caldav
-        ├── SKILL.md                # 技能说明（Agent 读取）
-        ├── scripts/
-        │   └── wecom_caldav.py     # 主脚本（含所有子命令）
-        └── references/
-            └── caldav-api.md       # CalDAV API 参考
+├── scripts/
+│   └── wecom_caldav.py        # 主脚本（含所有子命令）
+└── references/
+    └── caldav-api.md          # CalDAV API 参考
 ```
 
 ## 安装到 Openclaw
@@ -104,11 +102,11 @@ cd ~/.openclaw/extensions
 git clone git@git.woa.com:muskhuang/wecom-caldav.git
 
 # 首次配置凭证 + 安装后台同步（一条命令搞定）
-python3 ~/.openclaw/extensions/wecom-caldav/skills/wecom-caldav/scripts/wecom_caldav.py install \
+python3 ~/.openclaw/extensions/wecom-caldav/scripts/wecom_caldav.py install \
   --username <邮箱> --password <CalDAV密码>
 ```
 
-Openclaw 启动时会自动发现并加载本 extension 包下的所有 skill。
+Openclaw 启动时会通过 `openclaw.plugin.json` 自动加载本 skill。
 
 ## 存储位置
 
