@@ -1,7 +1,7 @@
 {
-  "id": "wecom-caldav",
-  "name": "WeCom CalDAV",
-  "description": "企业微信日历管理 (CalDAV + 本地缓存 + cron 后台同步)",
+  "id": "calendar-sync",
+  "name": "Calendar Sync",
+  "description": "多源日历同步（企微 + iCloud），本地缓存 + cron 后台同步，查询毫秒级响应，支持企微→iCloud 单向镜像",
   "skills": ["."],
   "configSchema": {
     "type": "object",

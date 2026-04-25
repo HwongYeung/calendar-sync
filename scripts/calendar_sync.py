@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""WeChat Work (企业微信) CalDAV Calendar Client
+"""calendar-sync — Multi-source CalDAV calendar aggregator
 
-Supports: list-calendars, query, create, delete operations
-against the WeChat Work CalDAV server (caldav.wecom.work).
+Sources supported:
+  - WeChat Work (企业微信) via caldav.wecom.work
+  - Apple iCloud via caldav.icloud.com (mirror target only, write-only)
 
-Config is stored in ~/.openclaw/extensions/wecom-caldav/config.json
+Features: list-calendars, query, create, delete, sync, mirror-apple,
+         cron-based background sync, local JSON cache for sub-second query.
+
+Config is stored in ~/.openclaw/extensions/calendar-sync/config.json
 
 Author: muskhuang
-Repository: https://git.woa.com/muskhuang/wecom-caldav
+Repository: https://github.com/HwongYeung/calendar-sync
 """
 
 import argparse
@@ -20,8 +24,8 @@ from datetime import datetime, timedelta
 import caldav
 from dateutil.parser import isoparse
 
-CONFIG_PATH = os.path.expanduser("~/.openclaw/extensions/wecom-caldav/config.json")
-CACHE_DIR = os.path.expanduser("~/.openclaw/extensions/wecom-caldav/cache")
+CONFIG_PATH = os.path.expanduser("~/.openclaw/extensions/calendar-sync/config.json")
+CACHE_DIR = os.path.expanduser("~/.openclaw/extensions/calendar-sync/cache")
 CACHE_EVENTS_PATH = os.path.join(CACHE_DIR, "events.json")
 CACHE_META_PATH = os.path.join(CACHE_DIR, "meta.json")
 CACHE_STALE_MINUTES = 20  # warn if cache older than this
@@ -34,6 +38,10 @@ def load_cache():
     try:
         with open(CACHE_EVENTS_PATH, "r") as f:
             events = json.load(f)
+        # Backward compat: ensure all events have "source" field
+        for ev in events:
+            if "source" not in ev:
+                ev["source"] = "wecom"
         meta = {}
         if os.path.exists(CACHE_META_PATH):
             with open(CACHE_META_PATH, "r") as f:
@@ -96,6 +104,47 @@ def get_client(config):
     """Create and return a caldav DAVClient."""
     url = config.get("url", "https://caldav.wecom.work/calendar/")
     return caldav.DAVClient(url=url, username=config["username"], password=config["password"])
+
+
+def get_apple_client(config):
+    """Create and return an Apple iCloud CalDAV DAVClient."""
+    apple_cfg = config.get("apple", {})
+    if not apple_cfg.get("username") or not apple_cfg.get("password"):
+        return None
+    url = apple_cfg.get("url", "https://caldav.icloud.com")
+    return caldav.DAVClient(
+        url=url,
+        username=apple_cfg["username"],
+        password=apple_cfg["password"],
+    )
+
+
+def get_apple_principal(config):
+    """Get the Apple iCloud CalDAV principal."""
+    client = get_apple_client(config)
+    if client is None:
+        return None
+    return client.principal()
+
+
+def find_or_create_mirror_calendar(config):
+    """Find or create the 'WeCom Mirror' calendar on iCloud. Returns the calendar object."""
+    principal = get_apple_principal(config)
+    if principal is None:
+        return None
+    calendars = principal.calendars()
+    mirror_name = "WeCom Mirror"
+    for cal in calendars:
+        try:
+            name = cal.get_display_name()
+        except Exception:
+            name = ""
+        if name == mirror_name:
+            return cal
+    # Not found: create it
+    new_cal = principal.make_calendar(name=mirror_name)
+    print(f"✅ 已创建 iCloud 日历: {mirror_name}")
+    return new_cal
 
 
 def get_principal(config):
@@ -543,8 +592,14 @@ def cmd_query(args):
                 _print_event(ev)
 
 
-def parse_ics_event(ics_text):
-    """Parse a VEVENT from ICS text into a dict."""
+def parse_ics_event(ics_text, source="wecom"):
+    """Parse a VEVENT from ICS text into a dict.
+    
+    Args:
+        ics_text: The ICS file content as a string.
+        source: Source identifier for this event (e.g., "wecom", "apple").
+                  Stored as the "source" field in the returned dict.
+    """
     event = {}
     in_vevent = False
     current_key = None
@@ -558,6 +613,7 @@ def parse_ics_event(ics_text):
         if line == "END:VEVENT":
             if current_key:
                 event[current_key] = current_val
+            event["source"] = source
             break
         if not in_vevent:
             continue
@@ -855,6 +911,322 @@ def cmd_delete(args):
         sys.exit(1)
 
 
+def cmd_setup_apple(args):
+    """Configure Apple iCloud CalDAV credentials."""
+    config = load_config() or {}
+    apple_cfg = config.get("apple", {})
+
+    username = args.username or apple_cfg.get("username") or input("iCloud 邮箱: ").strip()
+    password = args.password or apple_cfg.get("password") or input("iCloud App-Specific Password: ").strip()
+
+    if not username or not password:
+        print("❌ 用户名和密码不能为空")
+        sys.exit(1)
+
+    # Test connection
+    test_config = dict(config)
+    test_config["apple"] = {"username": username, "password": password}
+    try:
+        client = get_apple_client(test_config)
+        if client is None:
+            print("❌ 无法创建 iCloud CalDAV 客户端")
+            sys.exit(1)
+        principal = client.principal()
+        calendars = principal.calendars()
+        print(f"✅ iCloud 连接成功! 发现 {len(calendars)} 个日历")
+        for cal in calendars:
+            try:
+                name = cal.get_display_name()
+            except Exception:
+                name = str(cal.url)
+            print(f"  - {name}")
+    except Exception as e:
+        print(f"❌ iCloud 连接失败: {e}")
+        print("💡 请确保使用了正确的 app-specific password（不是 iCloud 登录密码）")
+        print("   生成方式: https://support.apple.com/zh-cn/HT204397")
+        sys.exit(1)
+
+    # Save config
+    config["apple"] = {"username": username, "password": password}
+    save_config(config)
+    print(f"✅ iCloud 凭证已保存到 {CONFIG_PATH}")
+
+    # Ask if user wants to run mirror now
+    try:
+        ans = input("\n是否现在运行一次镜像同步？[y/N]: ").strip().lower()
+    except EOFError:
+        ans = "n"
+    if ans in ("y", "yes"):
+        print()
+        mirror_args = argparse.Namespace(start=None, end=None)
+        cmd_mirror_apple(mirror_args)
+
+
+def _event_fingerprint(ev):
+    """Compute a fingerprint for change detection."""
+    import hashlib
+    parts = [
+        str(ev.get("summary", "")),
+        str(ev.get("dtstart", "")),
+        str(ev.get("dtend", "")),
+        str(ev.get("location", "")),
+        str(ev.get("description", "")),
+    ]
+    return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def _build_icloud_ics(ev, mirror_uid, dtstart_iso, dtend_iso):
+    """Build ICS content for an iCloud event (mirror)."""
+    dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    # Parse dtstart/dtend to build ICS DTSTART/DTEND
+    try:
+        ds = isoparse(dtstart_iso) if isinstance(dtstart_iso, str) else dtstart_iso
+        de = isoparse(dtend_iso) if isinstance(dtend_iso, str) else dtend_iso
+        dtstart_ics = ds.strftime("%Y%m%dT%H%M%S")
+        dtend_ics = de.strftime("%Y%m%dT%H%M%S")
+    except Exception:
+        dtstart_ics = dtstart_iso.replace("-", "").replace(":", "") if isinstance(dtstart_iso, str) else str(dtstart_iso)
+        dtend_ics = dtend_iso.replace("-", "").replace(":", "") if isinstance(dtend_iso, str) else str(dtend_iso)
+
+    summary = ev.get("summary", "(无标题)")
+    location = ev.get("location", "")
+    description = ev.get("description", "")
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Calendar-Sync//WeCom Mirror//EN",
+        "CALSCALE:GREGORIAN",
+        "BEGIN:VTIMEZONE",
+        "TZID:Asia/Shanghai",
+        "BEGIN:STANDARD",
+        "DTSTART:19700101T000000",
+        "TZOFFSETFROM:+0800",
+        "TZOFFSETTO:+0800",
+        "END:STANDARD",
+        "END:VTIMEZONE",
+        "BEGIN:VEVENT",
+        f"UID:{mirror_uid}",
+        f"DTSTAMP:{dtstamp}",
+        f"DTSTART;TZID=Asia/Shanghai:{dtstart_ics}",
+        f"DTEND;TZID=Asia/Shanghai:{dtend_ics}",
+        f"SUMMARY:{summary}",
+    ]
+    if location:
+        lines.append(f"LOCATION:{location}")
+    if description:
+        lines.append(f"DESCRIPTION:{description}")
+    lines.extend([
+        "BEGIN:VALARM",
+        "TRIGGER:-PT15M",
+        "ACTION:DISPLAY",
+        "DESCRIPTION:Reminder",
+        "END:VALARM",
+        "END:VEVENT",
+        "END:VCALENDAR",
+    ])
+    return "\r\n".join(lines)
+
+
+def cmd_mirror_apple(args):
+    """Mirror WeCom events from cache to Apple iCloud calendar."""
+    config = load_config()
+    if not config:
+        print("❌ 未配置企微凭证。请先运行: calendar_sync.py setup")
+        sys.exit(1)
+
+    apple_cfg = config.get("apple", {})
+    if not apple_cfg.get("username") or not apple_cfg.get("password"):
+        print("❌ 未配置 iCloud 凭证。请先运行: calendar_sync.py setup-apple")
+        sys.exit(1)
+
+    # Find or create mirror calendar
+    print("🔄 连接 iCloud CalDAV...")
+    mirror_cal = find_or_create_mirror_calendar(config)
+    if mirror_cal is None:
+        print("❌ 无法访问或创建 iCloud 镜像日历")
+        sys.exit(1)
+
+    cal_url = str(mirror_cal.url).rstrip("/")
+    auth = f"{apple_cfg['username']}:{apple_cfg['password']}"
+
+    # Fetch existing mirror events from iCloud
+    print("🔄 获取 iCloud 中已有的镜像事件...")
+    import subprocess
+    propfind_body = '<?xml version="1.0"?><propfind xmlns="DAV:"><prop><getetag/></prop></propfind>'
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-u", auth, "-X", "PROPFIND", cal_url + "/",
+             "-H", "Depth: 1", "-H", "Content-Type: application/xml",
+             "-d", propfind_body],
+            capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        print("❌ 获取 iCloud 事件超时")
+        sys.exit(1)
+
+    import re
+    icloud_hrefs = re.findall(
+        r'<[A-Za-z]+:href>(/[^<]+\.ics)</[A-Za-z]+:href>',
+        result.stdout
+    )
+    # Filter to only wecom-mirror- UIDs
+    mirror_hrefs = [h for h in icloud_hrefs if "wecom-mirror-" in h]
+    print(f"   iCloud 中已有 {len(mirror_hrefs)} 个镜像事件")
+
+    # Build dict of existing mirror events: mirror_uid -> href
+    existing = {}
+    for href in mirror_hrefs:
+        uid_match = re.search(r'wecom-mirror-([a-f0-9-]+)\.ics', href)
+        if uid_match:
+            existing[uid_match.group(1)] = href
+
+    # Parse date range
+    if args.start:
+        start = datetime.strptime(args.start, "%Y-%m-%d")
+    else:
+        start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if args.end:
+        end = datetime.strptime(args.end, "%Y-%m-%d")
+    else:
+        end = start + timedelta(days=90)
+
+    # Load cache and filter WeCom events in range
+    events, meta = load_cache()
+    if events is None:
+        print("⚠️ 本地缓存不存在，先执行一次 sync...")
+        cmd_sync(argparse.Namespace(days_back=30, days_forward=90))
+        events, meta = load_cache()
+    if events is None:
+        print("❌ 无法获取本地缓存，镜像中止")
+        sys.exit(1)
+
+    filter_start = start.replace(hour=0, minute=0, second=0)
+    filter_end = end.replace(hour=23, minute=59, second=59)
+
+    wecom_events = []
+    for ev in events:
+        if ev.get("source") == "apple":
+            continue  # skip apple events
+        ev_start_str = ev.get("dtstart", "")
+        if not ev_start_str:
+            continue
+        try:
+            ev_dt = isoparse(ev_start_str) if isinstance(ev_start_str, str) else ev_start_str
+            ev_naive = ev_dt.replace(tzinfo=None) if hasattr(ev_dt, 'tzinfo') else ev_dt
+            if filter_start <= ev_naive <= filter_end:
+                wecom_events.append(ev)
+        except Exception:
+            continue
+
+    print(f"📅 企微缓存中在日期范围内共 {len(wecom_events)} 个事件")
+
+    # Build desired state: wecom_uid -> (event, fingerprint)
+    desired = {}
+    for ev in wecom_events:
+        uid = ev.get("uid", "")
+        if not uid:
+            continue
+        desired[uid] = {
+            "event": ev,
+            "fp": _event_fingerprint(ev),
+        }
+
+    # --- Phase 1: Delete mirror events whose WeCom original no longer exists ---
+    to_delete = [uid for uid in existing if uid not in desired]
+    if to_delete:
+        print(f"🗑️  删除 {len(to_delete)} 个已不存在的镜像事件...")
+        for uid in to_delete:
+            href = existing[uid]
+            url = f"https://caldav.icloud.com{href}" if not href.startswith("http") else href
+            try:
+                r = subprocess.run(
+                    ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                     "-u", auth, "-X", "DELETE", url],
+                    capture_output=True, text=True, timeout=10
+                )
+                code = r.stdout.strip()
+                if code in ("200", "204", "404"):
+                    print(f"  ✅ 已删除: wecom-mirror-{uid}")
+                else:
+                    print(f"  ⚠️ 删除失败 (HTTP {code}): wecom-mirror-{uid}")
+            except Exception as e:
+                print(f"  ❌ 删除出错: {e}")
+
+    # --- Phase 2: Add or update mirror events ---
+    print(f"🔼 同步 {len(desired)} 个镜像事件...")
+    added = 0
+    updated = 0
+    for uid, data in desired.items():
+        ev = data["event"]
+        fp = data["fp"]
+        mirror_uid = f"wecom-mirror-{uid}"
+        ics = _build_icloud_ics(
+            ev, mirror_uid,
+            ev.get("dtstart", ""),
+            ev.get("dtend", "")
+        )
+        ics_b = ics.encode("utf-8")
+
+        # Check if needs update
+        need_put = False
+        if uid not in existing:
+            need_put = True  # new
+            action = "新增"
+        else:
+            # Fetch existing ICS to compare fingerprint
+            href = existing[uid]
+            url = f"https://caldav.icloud.com{href}" if not href.startswith("http") else href
+            try:
+                r = subprocess.run(
+                    ["curl", "-s", "-u", auth, url],
+                    capture_output=True, text=True, timeout=10
+                )
+                if r.returncode == 0 and r.stdout:
+                    # Compare fingerprint by checking if ICS content changed
+                    # Simple strategy: always update (idempotent PUT)
+                    need_put = True
+                    action = "更新"
+            except Exception:
+                need_put = True
+                action = "更新(强制)"
+
+        if not need_put:
+            continue
+
+        # PUT to iCloud
+        put_url = f"{cal_url}/{mirror_uid}.ics"
+        tmp_path = f"/tmp/{mirror_uid}.ics"
+        with open(tmp_path, "w") as f:
+            f.write(ics)
+
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+                 "-u", auth, "-X", "PUT", put_url,
+                 "-H", "Content-Type: text/calendar; charset=utf-8",
+                 "--data-binary", f"@{tmp_path}"],
+                capture_output=True, text=True, timeout=15
+            )
+            code = r.stdout.strip()
+            if code in ("200", "201", "204", "207"):
+                if action == "新增":
+                    added += 1
+                else:
+                    updated += 1
+                print(f"  ✅ {action}: {ev.get('summary', uid)}")
+            else:
+                print(f"  ❌ {action}失败 (HTTP {code}): {ev.get('summary', uid)}")
+        except Exception as e:
+            print(f"  ❌ {action}出错: {e}")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    print()
+    print(f"✅ 镜像同步完成! 新增 {added} 个，更新 {updated} 个，删除 {len(to_delete)} 个")
+
+
 # ============================================================================
 # Sync & background daemon
 # ============================================================================
@@ -907,7 +1279,7 @@ def cmd_cache_status(args):
 
 # --- Cross-platform scheduling via cron (Linux + macOS) ---
 
-CRON_TAG = "# wecom-caldav-sync"  # unique marker for our cron entry
+CRON_TAG = "# calendar-sync"  # unique marker for our cron entry
 
 
 def _current_crontab():
@@ -1004,7 +1376,7 @@ def cmd_daemon_status(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="企业微信 CalDAV 日程管理")
+    parser = argparse.ArgumentParser(description="Calendar Sync — 多源日历同步 (WeCom + iCloud)")
     subparsers = parser.add_subparsers(dest="command", help="操作命令")
 
     # setup
@@ -1047,6 +1419,16 @@ def main():
     subparsers.add_parser("daemon-uninstall", help="卸载后台同步任务")
     subparsers.add_parser("daemon-status", help="查看后台同步任务状态")
 
+    # setup-apple
+    p_setup_apple = subparsers.add_parser("setup-apple", help="配置 Apple iCloud CalDAV 凭证")
+    p_setup_apple.add_argument("--username", "-u", help="iCloud 邮箱")
+    p_setup_apple.add_argument("--password", "-p", help="iCloud App-Specific Password")
+
+    # mirror-apple
+    p_mirror = subparsers.add_parser("mirror-apple", help="将企微日程镜像到 Apple iCloud 日历")
+    p_mirror.add_argument("--start", help="开始日期 (YYYY-MM-DD，默认今天)")
+    p_mirror.add_argument("--end", help="结束日期 (YYYY-MM-DD，默认 90 天后)")
+
     # create
     p_create = subparsers.add_parser("create", help="创建日程")
     p_create.add_argument("--summary", "-t", required=True, help="日程标题")
@@ -1070,6 +1452,8 @@ def main():
     commands = {
         "setup": cmd_setup,
         "install": cmd_install,
+        "setup-apple": cmd_setup_apple,
+        "mirror-apple": cmd_mirror_apple,
         "list-calendars": cmd_list_calendars,
         "query": cmd_query,
         "sync": cmd_sync,
