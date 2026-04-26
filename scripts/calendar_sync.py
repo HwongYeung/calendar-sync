@@ -19,7 +19,7 @@ import json
 import os
 import sys
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import caldav
 from dateutil.parser import isoparse
@@ -730,7 +730,7 @@ def cmd_create(args):
         sys.exit(1)
 
     uid = f"{uuid.uuid4().hex}"
-    dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     dtstart_ics = dtstart.strftime("%Y%m%dT%H%M%S")
     dtend_ics = dtend.strftime("%Y%m%dT%H%M%S")
 
@@ -977,7 +977,7 @@ def _event_fingerprint(ev):
 
 def _build_icloud_ics(ev, mirror_uid, dtstart_iso, dtend_iso):
     """Build ICS content for an iCloud event (mirror)."""
-    dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     # Parse dtstart/dtend to build ICS DTSTART/DTEND
     try:
         ds = isoparse(dtstart_iso) if isinstance(dtstart_iso, str) else dtstart_iso
