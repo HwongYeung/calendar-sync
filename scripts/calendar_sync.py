@@ -2,10 +2,11 @@
 """calendar-sync — Multi-source CalDAV calendar aggregator
 
 Sources supported:
-  - WeChat Work (企业微信) via caldav.wecom.work
-  - Apple iCloud via caldav.icloud.com (mirror target only, write-only)
+  - WeChat Work (企业微信) via caldav.wecom.work   [read + write]
+  - Apple iCloud via caldav.icloud.com             [read + mirror target]
 
-Features: list-calendars, query, create, delete, sync, mirror-apple,
+Features: list-calendars, query (multi-source), create, delete,
+         sync (WeCom + Apple), mirror-apple (WeCom → iCloud one-way),
          cron-based background sync, local JSON cache for sub-second query.
 
 Config is stored in ~/.openclaw/extensions/calendar-sync/config.json
@@ -250,6 +251,9 @@ def _print_event(ev):
     location = ev.get("location", "")
     organizer = ev.get("organizer", "")
     uid = ev.get("uid", "")
+    source = ev.get("source", "wecom")
+    cal_name = ev.get("calendar_name") or ev.get("calendar_id", "")
+    source_tag = {"wecom": "💼 企微", "apple": "🍎 Apple"}.get(source, f"[{source}]")
     try:
         if isinstance(dtstart, str):
             dtstart = isoparse(dtstart).strftime("%Y-%m-%d %H:%M")
@@ -257,7 +261,11 @@ def _print_event(ev):
             dtend = isoparse(dtend).strftime("%H:%M")
     except Exception:
         pass
-    print(f"  📅 {summary}")
+    header = f"  📅 [{source_tag}]"
+    if cal_name and source == "apple":
+        header += f" [{cal_name}]"
+    header += f" {summary}"
+    print(header)
     print(f"     时间: {dtstart} ~ {dtend}")
     if location:
         print(f"     地点: {location}")
@@ -301,8 +309,11 @@ def cmd_query(args):
                 print(f"⚠️ 缓存已过期（{age_str}同步），建议加 --live 或运行 sync 命令刷新", file=sys.stderr)
 
             # Filter cached events by date range (events are pre-expanded w/ RRULE)
+            source_filter = getattr(args, "source", None)
             filtered = []
             for ev in cached_events:
+                if source_filter and source_filter != "all" and ev.get("source", "wecom") != source_filter:
+                    continue
                 ev_start_str = ev.get("dtstart", "")
                 if not ev_start_str:
                     continue
@@ -317,11 +328,12 @@ def cmd_query(args):
                     continue
             filtered.sort(key=lambda e: str(e.get("dtstart", "")))
 
-            # Dedupe by (summary, dtstart) across calendars/duplicate ics files
+            # Dedupe within the SAME source (summary+dtstart); keep cross-source duplicates
+            # so user can see both 企微 and Apple versions of the same meeting.
             seen = set()
             unique = []
             for e in filtered:
-                k = (e.get("summary", ""), e.get("dtstart", ""))
+                k = (e.get("source", "wecom"), e.get("summary", ""), e.get("dtstart", ""))
                 if k not in seen:
                     seen.add(k)
                     unique.append(e)
@@ -951,15 +963,31 @@ def cmd_setup_apple(args):
     save_config(config)
     print(f"✅ iCloud 凭证已保存到 {CONFIG_PATH}")
 
-    # Ask if user wants to run mirror now
-    try:
-        ans = input("\n是否现在运行一次镜像同步？[y/N]: ").strip().lower()
-    except EOFError:
-        ans = "n"
-    if ans in ("y", "yes"):
+    # If called from install-apple, skip interactive prompts
+    if getattr(args, "auto_sync", False):
         print()
-        mirror_args = argparse.Namespace(start=None, end=None)
-        cmd_mirror_apple(mirror_args)
+        print("🔄 立即执行一次全量同步 (WeCom + Apple)...")
+        cmd_sync(argparse.Namespace(days_back=None, days_forward=None))
+        return
+
+    try:
+        ans = input("\n是否现在立即同步 Apple 日历到本地缓存？[Y/n]: ").strip().lower()
+    except EOFError:
+        ans = "y"
+    if ans in ("", "y", "yes"):
+        print()
+        print("🔄 正在同步...")
+        cmd_sync(argparse.Namespace(days_back=None, days_forward=None))
+
+
+def cmd_install_apple(args):
+    """All-in-one: setup Apple iCloud credentials + trigger a full sync."""
+    setup_args = argparse.Namespace(
+        username=args.username,
+        password=args.password,
+        auto_sync=True,
+    )
+    cmd_setup_apple(setup_args)
 
 
 def _event_fingerprint(ev):
@@ -1231,29 +1259,252 @@ def cmd_mirror_apple(args):
 # Sync & background daemon
 # ============================================================================
 
+def fetch_apple_events(config, filter_start, filter_end, verbose=True):
+    """Fetch all events from Apple iCloud CalDAV within the given date range.
+
+    Returns a list of event dicts (same schema as parse_ics_event, source='apple'),
+    with RRULE recurrence expanded client-side. Skips the 'WeCom Mirror'
+    calendar to avoid duplicating WeCom events that were mirrored there.
+    """
+    import subprocess, re
+    from concurrent.futures import ThreadPoolExecutor
+    from dateutil.rrule import rrulestr
+    from email.utils import parsedate_to_datetime
+
+    apple_cfg = config.get("apple", {})
+    if not apple_cfg.get("username") or not apple_cfg.get("password"):
+        if verbose:
+            print("ℹ️ 未配置 iCloud 凭证，跳过 Apple 同步", file=sys.stderr)
+        return []
+
+    try:
+        client = get_apple_client(config)
+        principal = client.principal()
+        calendars = principal.calendars()
+    except Exception as e:
+        print(f"❌ 连接 iCloud 失败: {e}", file=sys.stderr)
+        return []
+
+    auth = f"{apple_cfg['username']}:{apple_cfg['password']}"
+    all_events = []
+
+    for cal in calendars:
+        try:
+            cal_name = cal.get_display_name() or ""
+        except Exception:
+            cal_name = ""
+        cal_url = str(cal.url).rstrip("/")
+        cal_id = cal_url.split("/")[-1]
+
+        # Skip the mirror calendar to avoid duplicating WeCom events
+        if cal_name == "WeCom Mirror":
+            if verbose:
+                print(f"   ⏭️  跳过 iCloud 镜像日历: {cal_name}", file=sys.stderr)
+            continue
+
+        # Use CalDAV calendar-query REPORT: Apple iCloud respects time-range
+        # correctly (unlike WeCom), and PROPFIND on iCloud doesn't enumerate events.
+        # iCloud XML responses have NO namespace prefix (e.g. <href>...</href>),
+        # so our regex must allow optional prefix.
+        report_start = filter_start.strftime("%Y%m%dT000000Z")
+        report_end = filter_end.strftime("%Y%m%dT235959Z")
+        report_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:getetag/>
+  </d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT">
+        <c:time-range start="{report_start}" end="{report_end}"/>
+      </c:comp-filter>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>"""
+        try:
+            result = subprocess.run(
+                ["curl", "-s", "-u", auth, "-X", "REPORT", cal_url + "/",
+                 "-H", "Depth: 1", "-H", "Content-Type: application/xml",
+                 "-d", report_body],
+                capture_output=True, text=True, timeout=60
+            )
+        except subprocess.TimeoutExpired:
+            print(f"⚠️ iCloud 日历 {cal_name!r} REPORT 超时，跳过", file=sys.stderr)
+            continue
+
+        if result.returncode != 0 or not result.stdout:
+            continue
+
+        # Parse hrefs — iCloud uses no prefix, so make prefix optional
+        hrefs_raw = re.findall(
+            r'<(?:[A-Za-z]+:)?href>([^<]+\.ics)</(?:[A-Za-z]+:)?href>',
+            result.stdout
+        )
+        # Skip our own mirror artifacts
+        hrefs = [h for h in hrefs_raw if "wecom-mirror-" not in h]
+        if verbose:
+            print(f"🍎 [{cal_name}] REPORT 返回 {len(hrefs_raw)} 个 ics，过滤 mirror 后 GET {len(hrefs)} 个", file=sys.stderr)
+
+        def _fetch(href):
+            # href may be absolute or relative
+            if href.startswith("http"):
+                url = href
+            else:
+                url = f"https://caldav.icloud.com{href}"
+            try:
+                r = subprocess.run(
+                    ["curl", "-s", "-u", auth, url],
+                    capture_output=True, text=True, timeout=15
+                )
+                return href, r.stdout if r.returncode == 0 else None
+            except subprocess.TimeoutExpired:
+                return href, None
+
+        with ThreadPoolExecutor(max_workers=15) as ex:
+            fetched = list(ex.map(_fetch, hrefs))
+
+        for href, ics_text in fetched:
+            if not ics_text:
+                continue
+            event = parse_ics_event(ics_text, source="apple")
+            if not event:
+                continue
+
+            ev_start = event.get("dtstart")
+            if not ev_start:
+                continue
+            try:
+                ev_dt = isoparse(ev_start) if isinstance(ev_start, str) else ev_start
+                ev_start_naive = ev_dt.replace(tzinfo=None) if hasattr(ev_dt, "tzinfo") else ev_dt
+            except Exception:
+                ev_start_naive = None
+
+            ev_end = event.get("dtend")
+            ev_end_naive = None
+            if ev_end:
+                try:
+                    ev_end_dt = isoparse(ev_end) if isinstance(ev_end, str) else ev_end
+                    ev_end_naive = ev_end_dt.replace(tzinfo=None) if hasattr(ev_end_dt, "tzinfo") else ev_end_dt
+                except Exception:
+                    pass
+
+            rrule_str = event.get("rrule")
+            exdates = event.get("exdate", [])
+            if not isinstance(exdates, list):
+                exdates = [exdates] if exdates else []
+
+            if rrule_str and ev_start_naive:
+                try:
+                    duration = (ev_end_naive - ev_start_naive) if ev_end_naive else timedelta(minutes=30)
+                    rrule_clean = re.sub(r'(UNTIL=\d{8}T\d{6})Z', r'\1', rrule_str)
+                    rule = rrulestr(rrule_clean, dtstart=ev_start_naive)
+                    excluded = set()
+                    for exd in exdates:
+                        try:
+                            ex_dt = isoparse(exd) if isinstance(exd, str) else exd
+                            excluded.add(ex_dt.replace(tzinfo=None) if hasattr(ex_dt, "tzinfo") else ex_dt)
+                        except Exception:
+                            pass
+                    for occ in rule.between(filter_start, filter_end, inc=True):
+                        if occ in excluded:
+                            continue
+                        occ_event = dict(event)
+                        occ_event["dtstart"] = occ.strftime("%Y-%m-%dT%H:%M:%S")
+                        occ_event["dtend"] = (occ + duration).strftime("%Y-%m-%dT%H:%M:%S")
+                        occ_event["calendar_id"] = cal_id
+                        occ_event["calendar_name"] = cal_name
+                        occ_event["ics_path"] = href
+                        occ_event["recurring"] = True
+                        occ_event["source"] = "apple"
+                        all_events.append(occ_event)
+                except Exception:
+                    if ev_start_naive and filter_start <= ev_start_naive <= filter_end:
+                        event["calendar_id"] = cal_id
+                        event["calendar_name"] = cal_name
+                        event["ics_path"] = href
+                        all_events.append(event)
+            else:
+                if ev_start_naive and filter_start <= ev_start_naive <= filter_end:
+                    event["calendar_id"] = cal_id
+                    event["calendar_name"] = cal_name
+                    event["ics_path"] = href
+                    all_events.append(event)
+
+    return all_events
+
+
 def cmd_sync(args):
-    """Full-scan fetch and write to local cache. Intended for cron/daemon use."""
-    # Reuse cmd_query's live-fetch path with flags to suppress stdout and write cache.
+    """Full-scan fetch from ALL sources (WeCom + Apple) and write to local cache.
+
+    Intended for cron/daemon use. If Apple is not configured it silently
+    syncs only WeCom. If WeCom is not configured it tries Apple only.
+    """
     import argparse as _ap
     from datetime import datetime as _dt, timedelta as _td
+
+    config = load_config()
+    if not config:
+        print("❌ 未配置任何日历源。请先运行: calendar_sync.py setup", file=sys.stderr)
+        sys.exit(1)
+
     # Default sync window: 30 days back ~ 90 days forward (covers typical query ranges)
     days_back = args.days_back if args.days_back is not None else 30
     days_forward = args.days_forward if args.days_forward is not None else 90
     today = _dt.now().replace(hour=0, minute=0, second=0, microsecond=0)
     start = today - _td(days=days_back)
     end = today + _td(days=days_forward)
+    filter_start = start.replace(hour=0, minute=0, second=0)
+    filter_end = end.replace(hour=23, minute=59, second=59)
 
-    fake_args = _ap.Namespace(
-        start=start.strftime("%Y-%m-%d"),
-        end=end.strftime("%Y-%m-%d"),
-        calendar=None,
-        json=False,
-        full_scan=True,
-        live=True,              # bypass cache read
-        _sync_mode=True,        # suppress stdout + write cache
-        _write_cache_on_success=True,
-    )
-    cmd_query(fake_args)
+    wecom_events = []
+    apple_events = []
+
+    # --- Source 1: WeChat Work ---
+    if config.get("username") and config.get("password"):
+        fake_args = _ap.Namespace(
+            start=start.strftime("%Y-%m-%d"),
+            end=end.strftime("%Y-%m-%d"),
+            calendar=None,
+            json=False,
+            full_scan=True,
+            live=True,
+            _sync_mode=True,
+            _write_cache_on_success=True,
+        )
+        try:
+            cmd_query(fake_args)
+            # cmd_query in sync mode already wrote the cache; read it back
+            cached, _ = load_cache()
+            if cached:
+                wecom_events = [ev for ev in cached if ev.get("source", "wecom") == "wecom"]
+        except Exception as e:
+            print(f"⚠️ 企微同步失败: {e}", file=sys.stderr)
+    else:
+        print("ℹ️ 未配置企微凭证，跳过企微同步", file=sys.stderr)
+
+    # --- Source 2: Apple iCloud ---
+    if config.get("apple", {}).get("username") and config.get("apple", {}).get("password"):
+        try:
+            apple_events = fetch_apple_events(config, filter_start, filter_end, verbose=True)
+            print(f"🍎 已从 iCloud 拉取 {len(apple_events)} 个事件", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ Apple 同步失败: {e}", file=sys.stderr)
+
+    # --- Merge and persist ---
+    merged = wecom_events + apple_events
+    # Sort by start time
+    merged.sort(key=lambda e: str(e.get("dtstart", "")))
+
+    sources = []
+    if wecom_events: sources.append(f"wecom={len(wecom_events)}")
+    if apple_events: sources.append(f"apple={len(apple_events)}")
+    meta_extra = {
+        "mode": "sync",
+        "window": f"{start.strftime('%Y-%m-%d')}~{end.strftime('%Y-%m-%d')}",
+        "sources": sources,
+    }
+    save_cache(merged, meta_extra=meta_extra)
+    print(f"✅ 已同步 {len(merged)} 个日程到缓存 [{', '.join(sources) or 'none'}]", file=sys.stderr)
 
 
 def cmd_cache_status(args):
@@ -1401,6 +1652,8 @@ def main():
     p_query.add_argument("--start", help="开始日期 (YYYY-MM-DD，默认本周一)")
     p_query.add_argument("--end", help="结束日期 (YYYY-MM-DD，默认一周后)")
     p_query.add_argument("--calendar", "-c", help="指定日历 ID (默认查询所有)")
+    p_query.add_argument("--source", choices=["all", "wecom", "apple"], default="all",
+                         help="按来源过滤: all (默认) / wecom / apple")
     p_query.add_argument("--json", action="store_true", help="以 JSON 格式输出")
     p_query.add_argument("--full-scan", action="store_true", help="全量扫描模式（绕过服务器 time-range 过滤 bug）")
     p_query.add_argument("--live", action="store_true", help="强制实时拉取，不使用缓存")
@@ -1423,6 +1676,11 @@ def main():
     p_setup_apple = subparsers.add_parser("setup-apple", help="配置 Apple iCloud CalDAV 凭证")
     p_setup_apple.add_argument("--username", "-u", help="iCloud 邮箱")
     p_setup_apple.add_argument("--password", "-p", help="iCloud App-Specific Password")
+
+    # install-apple (all-in-one: setup-apple + immediate sync)
+    p_install_apple = subparsers.add_parser("install-apple", help="一键安装 Apple 源: 配置凭证 + 立即同步")
+    p_install_apple.add_argument("--username", "-u", help="iCloud 邮箱")
+    p_install_apple.add_argument("--password", "-p", help="iCloud App-Specific Password")
 
     # mirror-apple
     p_mirror = subparsers.add_parser("mirror-apple", help="将企微日程镜像到 Apple iCloud 日历")
@@ -1453,6 +1711,7 @@ def main():
         "setup": cmd_setup,
         "install": cmd_install,
         "setup-apple": cmd_setup_apple,
+        "install-apple": cmd_install_apple,
         "mirror-apple": cmd_mirror_apple,
         "list-calendars": cmd_list_calendars,
         "query": cmd_query,

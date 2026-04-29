@@ -2,7 +2,7 @@
 name: calendar-sync
 author: muskhuang
 repository: https://github.com/HwongYeung/calendar-sync
-description: 多源日历同步技能，支持企业微信（WeCom CalDAV）和 Apple iCloud 日历。采用本地缓存 + cron 后台定时同步架构，查询毫秒级响应。支持企微日程的查询/创建/删除，以及企微→Apple iCloud 单向镜像同步。当用户需要查看日程、管理日历、或同步到 Apple 日历时触发。
+description: 多源日历同步技能，支持企业微信（WeCom CalDAV）和 Apple iCloud 日历，两源均通过 CalDAV 直接从云端读取。采用本地缓存 + cron 后台定时同步架构，查询毫秒级响应。支持企微日程的查询/创建/删除，Apple 日历云端直取，以及企微→Apple iCloud 单向镜像同步。当用户需要查看日程、管理日历、或同步到 Apple 日历时触发。
 ---
 
 # Calendar Sync — 多源日历同步
@@ -10,28 +10,31 @@ description: 多源日历同步技能，支持企业微信（WeCom CalDAV）和 
 支持多个日历源，统一查询和管理：
 
 - **企业微信**（WeCom CalDAV）— 完整支持：查询、创建、删除、后台同步
-- **Apple iCloud 日历** — 镜像模式（单向）：自动将企微日程推送到 iCloud 日历
+- **Apple iCloud 日历** — 云端直取（通过 `caldav.icloud.com` 官方 CalDAV 读取所有日历事件），同时也可作为企微镜像目标
 
 采用 **本地缓存 + cron 后台定时同步** 架构，查询响应时间从网络方案的 ~40 秒降到 ~0.1 秒。
 
 ## 架构
 
 ```
-                 ┌─────────────────────────────────┐
-cron (每15min)-->│ sync: 全量扫描 CalDAV → 本地缓存 │
-                 └──────────────┬──────────────────┘
-                                │
-                     ┌──────────▼──────────┐
-                     │ cache/events.json   │  ← 预展开事件（含 RRULE）
-                     │ cache/meta.json     │  ← 同步时间戳
-                     └──────────┬──────────┘
-                                │
-    user query / mirror --------┴----> 毫秒级返回
+                     ┌──────────────────────────────────────────────┐
+ cron (每 15min) --> │  sync: 企微 CalDAV + iCloud CalDAV  → 本地缓存 │
+                     └───────────────────────┬──────────────────────┘
+                                             │
+                                 ┌───────────▼───────────┐
+                                 │ cache/events.json     │  ← 预展开事件
+                                 │  [{source:"wecom",…}, │    (含 RRULE、
+                                 │   {source:"apple",…}] │     source 标签)
+                                 │ cache/meta.json       │  ← 同步时间戳
+                                 └───────────┬───────────┘
+                                             │
+      user query / mirror ------------------┴--------> 毫秒级返回
 ```
 
 - **缓存位置**: `~/.openclaw/extensions/calendar-sync/cache/`
 - **查询默认读缓存**；缓存过期（>20 分钟）会给出警告
 - **RRULE 已在 sync 阶段预展开**，缓存里就是可直接过滤的实例列表
+- **每条事件都带 `source` 字段**（`wecom` / `apple`），可用 `--source` 过滤
 - **镜像功能**: `mirror-apple` 命令将企微日程单向推送到 iCloud「WeCom Mirror」日历
 
 ## 前置条件
@@ -57,33 +60,43 @@ python3 scripts/calendar_sync.py install \
 
 **获取企微 CalDAV 密码**: 企微 → 工作台 → 日程 → 右上角「三」→ 日程设置 → 同步至其他日历 → 获取密码
 
-## iCloud 镜像配置
+## Apple iCloud 日历配置（云端直取 + 镜像）
 
 ```bash
+# 推荐：一键安装（配置凭证 + 立即全量同步）
+python3 scripts/calendar_sync.py install-apple \
+  --username <iCloud邮箱> --password <app-specific密码>
+
+# 或仅保存凭证
 python3 scripts/calendar_sync.py setup-apple \
   --username <iCloud邮箱> --password <app-specific密码>
 ```
 
 - iCloud 凭证保存在同一 `config.json` 的 `apple` 字段下
-- 需要生成 **app-specific password**（iCloud 设置 → 安全 → App-Specific Password）
-- 镜像目标日历名：`WeCom Mirror`（自动创建）
+- 需要生成 **app-specific password**（[appleid.apple.com](https://appleid.apple.com) → 登录与安全 → App 专属密码）
+- 一旦配置，后台 cron 会**同时同步企微 + Apple**，两边事件都进本地缓存
+- 写入镜像的目标日历仍叫 `WeCom Mirror`，读取时会自动跳过该日历避免循环
 
 ## 日常使用
 
 ### 查询日程（毫秒级，推荐）
 
 ```bash
-# 本周日程
+# 本周所有来源
 python3 scripts/calendar_sync.py query
 
 # 指定日期范围
 python3 scripts/calendar_sync.py query --start 2026-04-20 --end 2026-04-26
 
+# 只看企微 / 只看 Apple
+python3 scripts/calendar_sync.py query --source wecom
+python3 scripts/calendar_sync.py query --source apple
+
 # JSON 格式输出
 python3 scripts/calendar_sync.py query --json
 ```
 
-`query` 默认从本地缓存读取，通常 < 100ms 返回。
+`query` 默认从本地缓存读取，通常 < 100ms 返回。结果会在标题前打上 `[💼 企微]` / `[🍎 Apple]` 标签，Apple 事件还会显示来源日历名称。
 
 ### 同步到 Apple iCloud 日历（镜像）
 
