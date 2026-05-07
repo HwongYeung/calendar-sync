@@ -1626,6 +1626,367 @@ def cmd_daemon_status(args):
     cmd_cache_status(args)
 
 
+# ============================================================================
+# Daily notification: notify-* commands + 8:30 cron
+# ============================================================================
+
+NOTIFY_CRON_TAG = "# calendar-sync-notify"
+
+
+def _today_events_for_notify():
+    """Return today's events from cache, sorted by start time, deduped per source."""
+    events, meta = load_cache()
+    if events is None:
+        return [], meta
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    filter_start = today
+    filter_end = today.replace(hour=23, minute=59, second=59)
+    out = []
+    seen = set()
+    for ev in events:
+        s = ev.get("dtstart", "")
+        if not s:
+            continue
+        try:
+            ev_dt = isoparse(s) if isinstance(s, str) else s
+            ev_naive = ev_dt.replace(tzinfo=None) if hasattr(ev_dt, "tzinfo") else ev_dt
+        except Exception:
+            continue
+        if not (filter_start <= ev_naive <= filter_end):
+            continue
+        k = (ev.get("source", "wecom"), ev.get("summary", ""), ev.get("dtstart", ""))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(ev)
+    out.sort(key=lambda e: str(e.get("dtstart", "")))
+    return out, meta
+
+
+def _format_event_lines(ev, fmt="text"):
+    """Render one event as a single-line summary for notifications."""
+    summary = ev.get("summary", "(无标题)")
+    src = ev.get("source", "wecom")
+    src_tag = {"wecom": "💼", "apple": "🍎"}.get(src, "📅")
+    cal_name = ev.get("calendar_name", "") if src == "apple" else ""
+    try:
+        ds = isoparse(ev.get("dtstart", "")).strftime("%H:%M") if ev.get("dtstart") else "??:??"
+    except Exception:
+        ds = "??:??"
+    try:
+        de = isoparse(ev.get("dtend", "")).strftime("%H:%M") if ev.get("dtend") else ""
+    except Exception:
+        de = ""
+    time_part = f"{ds}–{de}" if de and de != ds else ds
+    cal_part = f"[{cal_name}] " if cal_name else ""
+    location = ev.get("location", "")
+    loc_part = ""
+    if location:
+        # Truncate long URLs / locations
+        loc_short = location.split("\n")[0][:50]
+        if loc_short:
+            loc_part = f"\n      📍 {loc_short}"
+    return f"{src_tag} {time_part}  {cal_part}{summary}{loc_part}"
+
+
+def _build_notify_message():
+    """Build (subject, plain_body, html_body) for today's notification."""
+    events, meta = _today_events_for_notify()
+    today = datetime.now()
+    weekday_cn = ["一", "二", "三", "四", "五", "六", "日"][today.weekday()]
+    date_str = today.strftime("%Y-%m-%d") + f" 周{weekday_cn}"
+
+    if not events:
+        subject = f"📅 {date_str}  今日无日程"
+        plain = f"今日（{date_str}）无任何日程。\n\n享受空闲的一天 🌿"
+        html = f"<h3>📅 {date_str}</h3><p>今日无任何日程。享受空闲的一天 🌿</p>"
+        return subject, plain, html
+
+    n = len(events)
+    subject = f"📅 {date_str}  今日 {n} 件日程"
+
+    # Plain text body
+    lines = [f"📅 {date_str}  今日 {n} 件日程", ""]
+    for ev in events:
+        lines.append(_format_event_lines(ev))
+        lines.append("")
+    plain = "\n".join(lines).strip()
+
+    # HTML body
+    html_rows = []
+    for ev in events:
+        try:
+            ds = isoparse(ev.get("dtstart", "")).strftime("%H:%M")
+        except Exception:
+            ds = "?"
+        try:
+            de = isoparse(ev.get("dtend", "")).strftime("%H:%M")
+        except Exception:
+            de = "?"
+        src = ev.get("source", "wecom")
+        src_label = {"wecom": "💼 企微", "apple": "🍎 Apple"}.get(src, src)
+        cal_name = ev.get("calendar_name", "") if src == "apple" else ""
+        cal_html = f' <span style="color:#888;font-size:12px">[{cal_name}]</span>' if cal_name else ""
+        loc = ev.get("location", "").split("\n")[0][:80]
+        loc_html = f'<div style="color:#666;font-size:12px;margin-top:2px">📍 {loc}</div>' if loc else ""
+        html_rows.append(
+            f'<div style="padding:10px;margin:6px 0;border-left:3px solid #4a90e2;background:#f7f9fc;border-radius:4px">'
+            f'<div><b>{ds}–{de}</b> &nbsp; <span style="color:#4a90e2">{src_label}</span>{cal_html}</div>'
+            f'<div style="margin-top:4px">{ev.get("summary", "(无标题)")}</div>'
+            f'{loc_html}'
+            f'</div>'
+        )
+    html = (
+        f'<div style="font-family:-apple-system,sans-serif;max-width:600px">'
+        f'<h3 style="margin:0 0 12px">📅 {date_str}　共 {n} 件日程</h3>'
+        + "".join(html_rows)
+        + '</div>'
+    )
+
+    return subject, plain, html
+
+
+def _push_macos(subject, body):
+    """Native macOS notification via osascript (best-effort, no error if not macOS)."""
+    if sys.platform != "darwin":
+        return False, "non-macOS, skipped"
+    import subprocess
+    # Escape double quotes for AppleScript
+    title = subject.replace('"', '\\"')
+    # macOS notification body limit ~256 chars
+    short = body.split("\n\n")[0]
+    short = short.replace('"', '\\"')[:240]
+    try:
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{short}" with title "{title}" sound name "Glass"'],
+            capture_output=True, text=True, timeout=10
+        )
+        return True, "ok"
+    except Exception as e:
+        return False, str(e)
+
+
+def _push_qqmail(subject, plain_body, html_body, notify_cfg):
+    """Send via QQ SMTP. Reads creds from config or env."""
+    qq_cfg = notify_cfg.get("qqmail", {})
+    user = qq_cfg.get("smtp_user") or os.environ.get("QQ_EMAIL_ACCOUNT")
+    pwd = qq_cfg.get("smtp_pass") or os.environ.get("QQ_EMAIL_AUTH_CODE")
+    to_addr = qq_cfg.get("to") or user
+    if not user or not pwd or not to_addr:
+        return False, "missing qqmail credentials (set notify.qqmail.{smtp_user,smtp_pass,to} or env QQ_EMAIL_*)"
+
+    import smtplib, ssl
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = user
+    msg["To"] = to_addr
+    msg.attach(MIMEText(plain_body, "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    ctx = ssl.create_default_context()
+    try:
+        with smtplib.SMTP_SSL("smtp.qq.com", 465, context=ctx, timeout=20) as smtp:
+            smtp.login(user, pwd)
+            smtp.send_message(msg)
+        return True, f"sent to {to_addr}"
+    except Exception as e:
+        return False, f"smtp error: {e}"
+
+
+def _push_wecom_webhook(subject, plain_body, notify_cfg):
+    """Send via WeCom group bot webhook (markdown message)."""
+    wb_cfg = notify_cfg.get("wecom_webhook", {})
+    url = wb_cfg.get("url") or os.environ.get("WECOM_WEBHOOK_URL")
+    if not url:
+        return False, "missing wecom_webhook.url"
+    import urllib.request, urllib.error
+    import json as _json
+    # Wrap as markdown
+    md = f"### {subject}\n\n```\n{plain_body}\n```"
+    payload = _json.dumps({
+        "msgtype": "markdown",
+        "markdown": {"content": md[:4000]},
+    }).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read().decode("utf-8")
+        return True, f"webhook ok: {data[:80]}"
+    except urllib.error.URLError as e:
+        return False, f"webhook error: {e}"
+
+
+def cmd_notify(args):
+    """Push today's events through configured channels."""
+    config = load_config() or {}
+    notify_cfg = config.get("notify", {})
+    channels = notify_cfg.get("channels", [])
+    if not channels:
+        print("❌ 未配置任何通知渠道。请运行: calendar_sync.py notify-setup", file=sys.stderr)
+        sys.exit(1)
+
+    # Optional: refresh cache before notifying (the daily 8:30 case benefits from fresh data)
+    if getattr(args, "sync_first", False):
+        try:
+            cmd_sync(argparse.Namespace(days_back=None, days_forward=None))
+        except Exception as e:
+            print(f"⚠️ 推送前 sync 失败: {e}", file=sys.stderr)
+
+    subject, plain, html = _build_notify_message()
+
+    # If --dry-run: just print what would be sent
+    if getattr(args, "dry_run", False):
+        print("=== DRY RUN ===")
+        print(f"Subject: {subject}")
+        print()
+        print(plain)
+        print()
+        print(f"Configured channels: {channels}")
+        return
+
+    results = {}
+    for ch in channels:
+        if ch == "macos":
+            ok, msg = _push_macos(subject, plain)
+        elif ch == "qqmail":
+            ok, msg = _push_qqmail(subject, plain, html, notify_cfg)
+        elif ch == "wecom_webhook":
+            ok, msg = _push_wecom_webhook(subject, plain, notify_cfg)
+        else:
+            ok, msg = False, f"unknown channel: {ch}"
+        results[ch] = (ok, msg)
+        flag = "✅" if ok else "❌"
+        print(f"{flag} [{ch}] {msg}")
+
+    if not any(ok for ok, _ in results.values()):
+        sys.exit(2)
+
+
+def cmd_notify_setup(args):
+    """Configure daily notification channels and credentials."""
+    config = load_config() or {}
+    notify_cfg = config.get("notify", {})
+
+    # Channels
+    chosen = args.channels
+    if not chosen:
+        print("可用渠道: macos / qqmail / wecom_webhook  (用逗号分隔多个)")
+        try:
+            ans = input("启用哪些渠道？[默认: macos]: ").strip() or "macos"
+        except EOFError:
+            ans = "macos"
+        chosen = [c.strip() for c in ans.split(",") if c.strip()]
+    notify_cfg["channels"] = chosen
+
+    # QQ mail
+    if "qqmail" in chosen:
+        cur = notify_cfg.get("qqmail", {})
+        smtp_user = args.qq_user or cur.get("smtp_user")
+        smtp_pass = args.qq_pass or cur.get("smtp_pass")
+        to_addr = args.qq_to or cur.get("to")
+        if not smtp_user:
+            try: smtp_user = input("QQ 邮箱地址 (xxx@qq.com): ").strip()
+            except EOFError: smtp_user = ""
+        if not smtp_pass:
+            try: smtp_pass = input("QQ 邮箱授权码 (非登录密码): ").strip()
+            except EOFError: smtp_pass = ""
+        if not to_addr:
+            to_addr = smtp_user  # default: send to self
+        notify_cfg["qqmail"] = {
+            "smtp_user": smtp_user,
+            "smtp_pass": smtp_pass,
+            "to": to_addr,
+        }
+
+    # WeCom webhook
+    if "wecom_webhook" in chosen:
+        cur = notify_cfg.get("wecom_webhook", {})
+        url = args.webhook_url or cur.get("url")
+        if not url:
+            try: url = input("企微群机器人 webhook URL: ").strip()
+            except EOFError: url = ""
+        notify_cfg["wecom_webhook"] = {"url": url}
+
+    config["notify"] = notify_cfg
+    save_config(config)
+    print(f"✅ 通知配置已保存到 {CONFIG_PATH}")
+    print(f"   启用渠道: {', '.join(chosen)}")
+    print()
+    print("💡 测试推送: calendar_sync.py notify --dry-run   (不实际发送)")
+    print("            calendar_sync.py notify              (真发一次)")
+    print("💡 安装定时任务: calendar_sync.py notify-install  (默认每天 08:30)")
+
+
+def cmd_notify_install(args):
+    """Install cron entry for daily notification (default 08:30)."""
+    hour = args.hour if args.hour is not None else 8
+    minute = args.minute if args.minute is not None else 30
+
+    py = os.environ.get("WECOM_PY") or sys.executable or "/usr/bin/env python3"
+    script = os.path.abspath(__file__)
+    log_path = os.path.join(CACHE_DIR, "notify.log")
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    cron_line = (
+        f"{minute} {hour} * * * {py} {script} notify --sync-first "
+        f">> {log_path} 2>&1 {NOTIFY_CRON_TAG}"
+    )
+
+    current = _current_crontab()
+    new_lines = [ln for ln in current.splitlines() if NOTIFY_CRON_TAG not in ln]
+    new_lines.append(cron_line)
+    _install_crontab("\n".join(new_lines) + "\n")
+
+    print(f"✅ 已安装每日通知 cron: 每天 {hour:02d}:{minute:02d}")
+    print(f"   命令: {cron_line}")
+    print(f"   日志: {log_path}")
+
+
+def cmd_notify_uninstall(args):
+    """Remove the daily notification cron entry."""
+    current = _current_crontab()
+    if NOTIFY_CRON_TAG not in current:
+        print("ℹ️ 未找到每日通知 cron（可能已卸载）")
+        return
+    new_lines = [ln for ln in current.splitlines() if NOTIFY_CRON_TAG not in ln]
+    _install_crontab("\n".join(new_lines) + "\n" if new_lines else "")
+    print("✅ 已卸载每日通知 cron")
+
+
+def cmd_notify_status(args):
+    """Show daily notification cron status."""
+    config = load_config() or {}
+    notify_cfg = config.get("notify", {})
+    channels = notify_cfg.get("channels", [])
+    print("📬 通知配置:")
+    if channels:
+        print(f"   启用渠道: {', '.join(channels)}")
+        if "qqmail" in channels:
+            qq = notify_cfg.get("qqmail", {})
+            print(f"   QQ 邮箱: {qq.get('smtp_user', '?')} → {qq.get('to', '?')}")
+        if "wecom_webhook" in channels:
+            wb = notify_cfg.get("wecom_webhook", {})
+            url = wb.get("url", "")
+            masked = url[:40] + "..." if len(url) > 43 else url
+            print(f"   企微 webhook: {masked or '(未配置)'}")
+    else:
+        print("   ⚠️ 未配置任何渠道，先运行 notify-setup")
+
+    print()
+    current = _current_crontab()
+    lines = [ln for ln in current.splitlines() if NOTIFY_CRON_TAG in ln]
+    if lines:
+        print("⏰ 定时任务:")
+        for ln in lines:
+            print(f"   {ln}")
+    else:
+        print("⏰ 定时任务: 未安装 (运行 notify-install 启用每天 08:30 推送)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Calendar Sync — 多源日历同步 (WeCom + iCloud)")
     subparsers = parser.add_subparsers(dest="command", help="操作命令")
@@ -1701,6 +2062,25 @@ def main():
     p_delete = subparsers.add_parser("delete", help="删除日程")
     p_delete.add_argument("--uid", required=True, help="要删除的日程 UID")
 
+    # ----- daily notify -----
+    p_notify = subparsers.add_parser("notify", help="按已配置渠道推送当日日程")
+    p_notify.add_argument("--sync-first", action="store_true", help="推送前先 sync 一次（cron 用）")
+    p_notify.add_argument("--dry-run", action="store_true", help="只打印消息，不真的发送")
+
+    p_notify_setup = subparsers.add_parser("notify-setup", help="配置每日推送渠道（macos / qqmail / wecom_webhook）")
+    p_notify_setup.add_argument("--channels", nargs="+", help="启用的渠道，例: macos qqmail wecom_webhook")
+    p_notify_setup.add_argument("--qq-user", help="QQ 邮箱地址")
+    p_notify_setup.add_argument("--qq-pass", help="QQ 邮箱授权码（非登录密码）")
+    p_notify_setup.add_argument("--qq-to", help="收件人，默认发给自己")
+    p_notify_setup.add_argument("--webhook-url", help="企微群机器人 webhook URL")
+
+    p_notify_install = subparsers.add_parser("notify-install", help="安装每日通知 cron（默认 08:30）")
+    p_notify_install.add_argument("--hour", type=int, default=None, help="小时 (0-23，默认 8)")
+    p_notify_install.add_argument("--minute", type=int, default=None, help="分钟 (0-59，默认 30)")
+
+    subparsers.add_parser("notify-uninstall", help="卸载每日通知 cron")
+    subparsers.add_parser("notify-status", help="查看通知配置 + cron 状态")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1722,6 +2102,11 @@ def main():
         "daemon-status": cmd_daemon_status,
         "create": cmd_create,
         "delete": cmd_delete,
+        "notify": cmd_notify,
+        "notify-setup": cmd_notify_setup,
+        "notify-install": cmd_notify_install,
+        "notify-uninstall": cmd_notify_uninstall,
+        "notify-status": cmd_notify_status,
     }
 
     commands[args.command](args)
