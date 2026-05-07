@@ -19,6 +19,7 @@
 - 🍎 **Apple iCloud 镜像**：单向推送企微日程到 iCloud 日历，自动去重、支持更新和删除
 - 🌐 **跨平台**：Linux 用 `/usr/bin/flock`，macOS 用 PID 锁文件兜底
 - ⚡ **一键安装**：`install` 命令一条龙配置凭证 + 首次同步 + cron 安装
+- 📬 **每日推送**：支持 macOS 通知、QQ 邮箱、企微 webhook，以及 hermes 多渠道（钉钉、飞书、Slack、Discord 等）
 
 ## 一次性安装
 
@@ -56,6 +57,10 @@ python3 scripts/calendar_sync.py query --start 2026-04-20 --end 2026-04-26
 
 # JSON 格式输出
 python3 scripts/calendar_sync.py query --json
+
+# 按来源过滤
+python3 scripts/calendar_sync.py query --source wecom
+python3 scripts/calendar_sync.py query --source apple
 ```
 
 ### 镜像到 Apple iCloud 日历
@@ -106,6 +111,106 @@ python3 scripts/calendar_sync.py daemon-install    # 安装 cron 任务 (默认 
 python3 scripts/calendar_sync.py daemon-uninstall  # 卸载 cron 任务
 ```
 
+## 每日通知推送
+
+支持多种渠道自动推送当日日程，包括内置渠道和 hermes 统一渠道。
+
+### 内置渠道
+
+| 渠道 | 说明 |
+|------|------|
+| `macos` | macOS 系统通知（osascript） |
+| `qqmail` | QQ 邮箱（SMTP） |
+| `wecom_webhook` | 企微群机器人 webhook |
+
+### Hermes 渠道（自动发现）
+
+如果系统安装了 hermes agent（`~/.qclaw-hermes/channel_directory.json`），`notify-setup` 会自动发现并展示已配置的渠道，支持的平台包括：
+
+| 平台 | 消息格式 |
+|------|----------|
+| `dingtalk` | Markdown 卡片 |
+| `feishu` | Interactive Card |
+| `slack` | Bold text + code block |
+| `discord` | Bold + code block |
+| 其他 webhook | 通用 Markdown |
+
+hermes 渠道**无需重复配置凭证**——直接复用 hermes 已有配置。
+
+### 配置通知渠道
+
+```bash
+# 交互式配置（自动列出内置 + hermes 可用渠道）
+python3 scripts/calendar_sync.py notify-setup
+
+# 仅列出 hermes 已配置渠道，快速选择
+python3 scripts/calendar_sync.py notify-setup --from-hermes
+
+# 非交互：直接指定内置渠道
+python3 scripts/calendar_sync.py notify-setup --channels macos wecom_webhook
+
+# 非交互：指定 hermes 渠道（platform:name 格式）
+python3 scripts/calendar_sync.py notify-setup --channels macos dingtalk:研发群
+```
+
+交互模式示例输出：
+
+```
+可用推送渠道:
+  [内置]
+    macos              - macOS 系统通知
+    qqmail             - QQ 邮箱
+    wecom_webhook      - 企微群机器人
+  [hermes 已配置]
+    wecom:办公群        - wecom (hermes)
+    dingtalk:研发群     - dingtalk (hermes)
+
+启用哪些渠道？(用逗号分隔) [默认: macos]:
+```
+
+### 测试 & 安装定时推送
+
+```bash
+# 测试：只打印消息内容，不实际发送
+python3 scripts/calendar_sync.py notify --dry-run
+
+# 实际推送一次
+python3 scripts/calendar_sync.py notify
+
+# 安装每日定时推送（默认 08:30）
+python3 scripts/calendar_sync.py notify-install
+python3 scripts/calendar_sync.py notify-install --hour 9 --minute 0
+
+# 查看通知配置和 cron 状态
+python3 scripts/calendar_sync.py notify-status
+
+# 卸载定时推送
+python3 scripts/calendar_sync.py notify-uninstall
+```
+
+### 通知配置存储格式
+
+配置存储在 `config.json` 的 `notify.channels` 字段中，支持两种格式：
+
+```json
+{
+  "notify": {
+    "channels": [
+      "macos",
+      "qqmail",
+      {"type": "hermes", "platform": "dingtalk", "index": 0, "name": "研发群"}
+    ],
+    "qqmail": { "smtp_user": "...", "smtp_pass": "...", "to": "..." },
+    "wecom_webhook": { "url": "..." }
+  }
+}
+```
+
+- 内置渠道：字符串（`"macos"`, `"qqmail"`, `"wecom_webhook"`）
+- Hermes 渠道：对象（含 `type`, `platform`, `index`, `name`）
+
+旧格式（纯字符串数组）完全兼容。
+
 ## 架构
 
 ```
@@ -147,12 +252,47 @@ calendar-sync/
 ├── SKILL.md                   # 技能说明（Agent / skill installer 读取）
 ├── openclaw.plugin.json       # Openclaw 插件清单（skills 指向 "."）
 ├── README.md                  # 本文档
+├── CLAUDE.md                  # Claude Code 开发指引
 ├── .gitignore
 ├── scripts/
-│   └── calendar_sync.py      # 主脚本（含所有子命令）
+│   └── calendar_sync.py      # 主脚本（含所有子命令，~2200 行）
 └── references/
     └── caldav-api.md         # CalDAV API 参考
 ```
+
+**用户数据**（不在仓库中，位于 `~/.openclaw/extensions/calendar-sync/`）：
+- `config.json` — 凭证配置（WeCom + Apple + 通知渠道）
+- `cache/events.json` — 日程缓存
+- `cache/meta.json` — 同步元数据（时间戳、窗口、来源）
+- `cache/sync.log` — cron 后台同步日志
+- `cache/notify.log` — 定时通知日志
+
+**Hermes 渠道目录**（由 hermes agent 维护）：
+- `~/.qclaw-hermes/channel_directory.json` — 统一渠道注册表
+
+## 完整命令列表
+
+| 命令 | 说明 |
+|------|------|
+| `install` | 一键安装：配置凭证 + 后台同步 |
+| `setup` | 配置 CalDAV 连接信息 |
+| `setup-apple` | 配置 iCloud CalDAV 凭证 |
+| `install-apple` | 一键安装 Apple 源 |
+| `list-calendars` | 列出所有日历 |
+| `query` | 查询日程（默认读缓存） |
+| `sync` | 全量同步到本地缓存 |
+| `cache-status` | 查看缓存状态 |
+| `daemon-install` | 安装后台同步 cron |
+| `daemon-uninstall` | 卸载后台同步 cron |
+| `daemon-status` | 查看 cron 状态 |
+| `mirror-apple` | 企微 → iCloud 镜像 |
+| `create` | 创建日程 |
+| `delete` | 删除日程 |
+| `notify` | 按已配置渠道推送当日日程 |
+| `notify-setup` | 配置推送渠道（内置 + hermes） |
+| `notify-install` | 安装每日通知 cron |
+| `notify-uninstall` | 卸载每日通知 cron |
+| `notify-status` | 查看通知配置 + cron 状态 |
 
 ## 安装到 Openclaw
 
@@ -169,6 +309,10 @@ python3 ~/.openclaw/extensions/calendar-sync/scripts/calendar_sync.py install \
 # （可选）配置 iCloud 镜像凭证
 python3 ~/.openclaw/extensions/calendar-sync/scripts/calendar_sync.py setup-apple \
   --username <iCloud邮箱> --password <app-specific密码>
+
+# （可选）配置每日通知
+python3 ~/.openclaw/extensions/calendar-sync/scripts/calendar_sync.py notify-setup
+python3 ~/.openclaw/extensions/calendar-sync/scripts/calendar_sync.py notify-install
 ```
 
 Openclaw 启动时会通过 `openclaw.plugin.json` 自动加载本 skill。
@@ -178,6 +322,7 @@ Openclaw 启动时会通过 `openclaw.plugin.json` 自动加载本 skill。
 - **配置文件**（凭证）：`~/.openclaw/extensions/calendar-sync/config.json`
 - **缓存**：`~/.openclaw/extensions/calendar-sync/cache/events.json`
 - **cron 日志**：`~/.openclaw/extensions/calendar-sync/cache/sync.log`
+- **通知日志**：`~/.openclaw/extensions/calendar-sync/cache/notify.log`
 
 > 这些目录均在用户主目录下，**未纳入版本控制**。凭证、缓存等不会被提交到仓库。
 
@@ -189,6 +334,7 @@ Openclaw 启动时会通过 `openclaw.plugin.json` 自动加载本 skill。
 - **time-range 过滤不可信**：必须 PROPFIND 全量 + 客户端过滤
 - **镜像 fingerprint**：用 `(summary, dtstart, dtend, location)` 的 MD5 作为变更判据
 - **iCloud CalDAV 地址**：`https://caldav.icloud.com`，使用 app-specific password 认证
+- **Hermes 渠道运行时读取**：每次推送时重新读取 hermes 配置文件，确保使用最新凭证
 
 详细说明见 [SKILL.md](./SKILL.md)。
 

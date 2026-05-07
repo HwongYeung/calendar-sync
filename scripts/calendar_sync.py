@@ -30,6 +30,7 @@ CACHE_DIR = os.path.expanduser("~/.openclaw/extensions/calendar-sync/cache")
 CACHE_EVENTS_PATH = os.path.join(CACHE_DIR, "events.json")
 CACHE_META_PATH = os.path.join(CACHE_DIR, "meta.json")
 CACHE_STALE_MINUTES = 20  # warn if cache older than this
+HERMES_CHANNEL_DIR = os.path.expanduser("~/.qclaw-hermes/channel_directory.json")
 
 
 def load_cache():
@@ -1746,6 +1747,49 @@ def _build_notify_message():
     return subject, plain, html
 
 
+def _discover_hermes_channels():
+    """读取 hermes channel_directory.json，返回 {platform: [channel_instances]} 中非空的平台."""
+    if not os.path.isfile(HERMES_CHANNEL_DIR):
+        return {}
+    try:
+        with open(HERMES_CHANNEL_DIR, "r") as f:
+            data = json.load(f)
+        platforms = data.get("platforms", {})
+        # 只返回有实际配置的平台（非空数组）
+        return {k: v for k, v in platforms.items() if v}
+    except Exception:
+        return {}
+
+
+def _push_hermes_channel(subject, plain_body, platform, channel_cfg):
+    """通用 hermes 渠道推送。根据 platform 类型选择消息格式."""
+    url = channel_cfg.get("url") or channel_cfg.get("webhook_url") or channel_cfg.get("webhook")
+    if not url:
+        return False, f"hermes channel [{platform}] missing url/webhook_url"
+
+    # 根据平台类型选择消息格式
+    if platform in ("dingtalk",):
+        payload = {"msgtype": "markdown", "markdown": {"title": subject, "text": f"### {subject}\n\n{plain_body}"}}
+    elif platform in ("feishu",):
+        payload = {"msg_type": "interactive", "card": {"header": {"title": {"content": subject}}, "elements": [{"tag": "markdown", "content": plain_body}]}}
+    elif platform in ("slack",):
+        payload = {"text": f"*{subject}*\n```\n{plain_body}\n```"}
+    elif platform in ("discord",):
+        payload = {"content": f"**{subject}**\n```\n{plain_body[:1900]}\n```"}
+    else:
+        # 通用 webhook: JSON with markdown content
+        payload = {"msgtype": "markdown", "markdown": {"content": f"### {subject}\n\n{plain_body[:4000]}"}}
+
+    import urllib.request, urllib.error
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return True, f"hermes [{platform}] ok"
+    except Exception as e:
+        return False, f"hermes [{platform}] error: {e}"
+
+
 def _push_macos(subject, body):
     """Native macOS notification via osascript (best-effort, no error if not macOS)."""
     if sys.platform != "darwin":
@@ -1845,22 +1889,45 @@ def cmd_notify(args):
         print()
         print(plain)
         print()
-        print(f"Configured channels: {channels}")
+        display_channels = []
+        for c in channels:
+            if isinstance(c, str):
+                display_channels.append(c)
+            elif isinstance(c, dict) and c.get("type") == "hermes":
+                display_channels.append(f"hermes:{c['platform']}:{c.get('name', c.get('index', 0))}")
+            else:
+                display_channels.append(str(c))
+        print(f"Configured channels: {display_channels}")
         return
 
     results = {}
     for ch in channels:
-        if ch == "macos":
+        if isinstance(ch, dict) and ch.get("type") == "hermes":
+            # 运行时重新读取 hermes 配置（获取最新凭证）
+            hermes = _discover_hermes_channels()
+            platform = ch["platform"]
+            idx = ch.get("index", 0)
+            instances = hermes.get(platform, [])
+            ch_label = f"hermes:{platform}:{ch.get('name', idx)}"
+            if idx < len(instances):
+                ok, msg = _push_hermes_channel(subject, plain, platform, instances[idx])
+            else:
+                ok, msg = False, f"hermes channel {platform}[{idx}] not found"
+        elif isinstance(ch, str) and ch == "macos":
+            ch_label = ch
             ok, msg = _push_macos(subject, plain)
-        elif ch == "qqmail":
+        elif isinstance(ch, str) and ch == "qqmail":
+            ch_label = ch
             ok, msg = _push_qqmail(subject, plain, html, notify_cfg)
-        elif ch == "wecom_webhook":
+        elif isinstance(ch, str) and ch == "wecom_webhook":
+            ch_label = ch
             ok, msg = _push_wecom_webhook(subject, plain, notify_cfg)
         else:
+            ch_label = str(ch)
             ok, msg = False, f"unknown channel: {ch}"
-        results[ch] = (ok, msg)
+        results[ch_label] = (ok, msg)
         flag = "✅" if ok else "❌"
-        print(f"{flag} [{ch}] {msg}")
+        print(f"{flag} [{ch_label}] {msg}")
 
     if not any(ok for ok, _ in results.values()):
         sys.exit(2)
@@ -1871,19 +1938,88 @@ def cmd_notify_setup(args):
     config = load_config() or {}
     notify_cfg = config.get("notify", {})
 
+    # 发现 hermes 已配置渠道
+    hermes = _discover_hermes_channels()
+    from_hermes = getattr(args, "from_hermes", False)
+
+    # 构建 hermes 渠道选项列表
+    hermes_options = []  # [(display_key, platform, index, name)]
+    for platform, instances in sorted(hermes.items()):
+        for idx, inst in enumerate(instances):
+            name = inst.get("name") or inst.get("label") or f"{idx}"
+            display_key = f"{platform}:{name}"
+            hermes_options.append((display_key, platform, idx, name))
+
     # Channels
     chosen = args.channels
     if not chosen:
-        print("可用渠道: macos / qqmail / wecom_webhook  (用逗号分隔多个)")
-        try:
-            ans = input("启用哪些渠道？[默认: macos]: ").strip() or "macos"
-        except EOFError:
-            ans = "macos"
-        chosen = [c.strip() for c in ans.split(",") if c.strip()]
-    notify_cfg["channels"] = chosen
+        # 展示可用渠道
+        if from_hermes:
+            # --from-hermes: 仅展示 hermes 渠道
+            if not hermes_options:
+                print("❌ 未发现 hermes 已配置渠道 (检查 ~/.qclaw-hermes/channel_directory.json)")
+                sys.exit(1)
+            print("hermes 已配置渠道:")
+            for i, (dk, plat, idx, name) in enumerate(hermes_options, 1):
+                print(f"  {i}. {dk:<20} - {plat} (hermes)")
+        else:
+            # 正常模式：内置 + hermes
+            print("可用推送渠道:")
+            print("  [内置]")
+            print("    macos              - macOS 系统通知")
+            print("    qqmail             - QQ 邮箱")
+            print("    wecom_webhook      - 企微群机器人")
+            if hermes_options:
+                print("  [hermes 已配置]")
+                for dk, plat, idx, name in hermes_options:
+                    print(f"    {dk:<20} - {plat} (hermes)")
+            print()
 
-    # QQ mail
-    if "qqmail" in chosen:
+        prompt_msg = "启用哪些渠道？(用逗号分隔)" if not from_hermes else "启用哪些 hermes 渠道？(用逗号或序号分隔)"
+        default = "macos" if not from_hermes else ""
+        try:
+            ans = input(f"{prompt_msg} [默认: {default}]: ").strip() if default else input(f"{prompt_msg}: ").strip()
+        except EOFError:
+            ans = default
+        if not ans:
+            ans = default
+        chosen = [c.strip() for c in ans.split(",") if c.strip()]
+
+    # 解析 chosen 中的 hermes 渠道引用（支持 "platform:name" 格式或序号）
+    final_channels = []
+    hermes_key_map = {dk: (plat, idx, name) for dk, plat, idx, name in hermes_options}
+    # 也按序号建 map（仅 from_hermes 模式才可能用到）
+    hermes_idx_map = {str(i): (plat, idx, name) for i, (dk, plat, idx, name) in enumerate(hermes_options, 1)}
+
+    for c in chosen:
+        if c in ("macos", "qqmail", "wecom_webhook"):
+            final_channels.append(c)
+        elif c in hermes_key_map:
+            plat, idx, name = hermes_key_map[c]
+            final_channels.append({"type": "hermes", "platform": plat, "index": idx, "name": name})
+        elif c in hermes_idx_map:
+            plat, idx, name = hermes_idx_map[c]
+            final_channels.append({"type": "hermes", "platform": plat, "index": idx, "name": name})
+        else:
+            # 尝试匹配 platform:name 模式
+            matched = False
+            for dk, plat, idx, name in hermes_options:
+                if c == dk or c == plat:
+                    final_channels.append({"type": "hermes", "platform": plat, "index": idx, "name": name})
+                    matched = True
+                    break
+            if not matched:
+                print(f"⚠️ 未知渠道: {c}，跳过")
+
+    if not final_channels:
+        print("❌ 未选择任何有效渠道")
+        sys.exit(1)
+
+    notify_cfg["channels"] = final_channels
+
+    # QQ mail — 仅当内置渠道被选中时才问
+    builtin_channels = [c for c in final_channels if isinstance(c, str)]
+    if "qqmail" in builtin_channels:
         cur = notify_cfg.get("qqmail", {})
         smtp_user = args.qq_user or cur.get("smtp_user")
         smtp_pass = args.qq_pass or cur.get("smtp_pass")
@@ -1902,8 +2038,8 @@ def cmd_notify_setup(args):
             "to": to_addr,
         }
 
-    # WeCom webhook
-    if "wecom_webhook" in chosen:
+    # WeCom webhook — 仅当内置渠道被选中时才问
+    if "wecom_webhook" in builtin_channels:
         cur = notify_cfg.get("wecom_webhook", {})
         url = args.webhook_url or cur.get("url")
         if not url:
@@ -1913,8 +2049,15 @@ def cmd_notify_setup(args):
 
     config["notify"] = notify_cfg
     save_config(config)
+    # 格式化渠道展示
+    display_channels = []
+    for c in final_channels:
+        if isinstance(c, str):
+            display_channels.append(c)
+        elif isinstance(c, dict):
+            display_channels.append(f"hermes:{c['platform']}:{c.get('name', c.get('index', 0))}")
     print(f"✅ 通知配置已保存到 {CONFIG_PATH}")
-    print(f"   启用渠道: {', '.join(chosen)}")
+    print(f"   启用渠道: {', '.join(display_channels)}")
     print()
     print("💡 测试推送: calendar_sync.py notify --dry-run   (不实际发送)")
     print("            calendar_sync.py notify              (真发一次)")
@@ -1964,15 +2107,38 @@ def cmd_notify_status(args):
     channels = notify_cfg.get("channels", [])
     print("📬 通知配置:")
     if channels:
-        print(f"   启用渠道: {', '.join(channels)}")
-        if "qqmail" in channels:
+        display_channels = []
+        for c in channels:
+            if isinstance(c, str):
+                display_channels.append(c)
+            elif isinstance(c, dict) and c.get("type") == "hermes":
+                display_channels.append(f"hermes:{c['platform']}:{c.get('name', c.get('index', 0))}")
+            else:
+                display_channels.append(str(c))
+        print(f"   启用渠道: {', '.join(display_channels)}")
+        if "qqmail" in [c for c in channels if isinstance(c, str)]:
             qq = notify_cfg.get("qqmail", {})
             print(f"   QQ 邮箱: {qq.get('smtp_user', '?')} → {qq.get('to', '?')}")
-        if "wecom_webhook" in channels:
+        if "wecom_webhook" in [c for c in channels if isinstance(c, str)]:
             wb = notify_cfg.get("wecom_webhook", {})
             url = wb.get("url", "")
             masked = url[:40] + "..." if len(url) > 43 else url
             print(f"   企微 webhook: {masked or '(未配置)'}")
+        # hermes 渠道详情
+        hermes_chs = [c for c in channels if isinstance(c, dict) and c.get("type") == "hermes"]
+        if hermes_chs:
+            hermes = _discover_hermes_channels()
+            for hc in hermes_chs:
+                plat = hc["platform"]
+                idx = hc.get("index", 0)
+                instances = hermes.get(plat, [])
+                if idx < len(instances):
+                    inst = instances[idx]
+                    url = inst.get("url") or inst.get("webhook_url") or inst.get("webhook") or ""
+                    masked = url[:40] + "..." if len(url) > 43 else url
+                    print(f"   hermes [{plat}:{hc.get('name', idx)}]: {masked or '(无 URL)'}")
+                else:
+                    print(f"   hermes [{plat}:{hc.get('name', idx)}]: ⚠️ 配置已不存在")
     else:
         print("   ⚠️ 未配置任何渠道，先运行 notify-setup")
 
@@ -2067,8 +2233,9 @@ def main():
     p_notify.add_argument("--sync-first", action="store_true", help="推送前先 sync 一次（cron 用）")
     p_notify.add_argument("--dry-run", action="store_true", help="只打印消息，不真的发送")
 
-    p_notify_setup = subparsers.add_parser("notify-setup", help="配置每日推送渠道（macos / qqmail / wecom_webhook）")
-    p_notify_setup.add_argument("--channels", nargs="+", help="启用的渠道，例: macos qqmail wecom_webhook")
+    p_notify_setup = subparsers.add_parser("notify-setup", help="配置每日推送渠道（macos / qqmail / wecom_webhook / hermes）")
+    p_notify_setup.add_argument("--channels", nargs="+", help="启用的渠道，例: macos qqmail wecom_webhook dingtalk:群名")
+    p_notify_setup.add_argument("--from-hermes", action="store_true", help="仅列出 hermes 已配置渠道，快速选择")
     p_notify_setup.add_argument("--qq-user", help="QQ 邮箱地址")
     p_notify_setup.add_argument("--qq-pass", help="QQ 邮箱授权码（非登录密码）")
     p_notify_setup.add_argument("--qq-to", help="收件人，默认发给自己")
