@@ -31,6 +31,7 @@ CACHE_EVENTS_PATH = os.path.join(CACHE_DIR, "events.json")
 CACHE_META_PATH = os.path.join(CACHE_DIR, "meta.json")
 CACHE_STALE_MINUTES = 20  # warn if cache older than this
 HERMES_CHANNEL_DIR = os.path.expanduser("~/.qclaw-hermes/channel_directory.json")
+OPENCLAW_CONFIG_PATH = os.path.expanduser("~/.openclaw/openclaw.json")
 
 
 def load_cache():
@@ -1790,6 +1791,66 @@ def _push_hermes_channel(subject, plain_body, platform, channel_cfg):
         return False, f"hermes [{platform}] error: {e}"
 
 
+def _discover_openclaw_channels():
+    """读取 openclaw.json 中已启用的 channels，返回 {channel_id: config}."""
+    if not os.path.isfile(OPENCLAW_CONFIG_PATH):
+        return {}
+    try:
+        with open(OPENCLAW_CONFIG_PATH, "r") as f:
+            data = json.load(f)
+        channels = data.get("channels", {})
+        # 只返回 enabled=true 的渠道
+        result = {}
+        for ch_id, ch_cfg in channels.items():
+            if isinstance(ch_cfg, dict) and ch_cfg.get("enabled", False):
+                result[ch_id] = ch_cfg
+        return result
+    except Exception:
+        return {}
+
+
+def _push_openclaw_channel(subject, plain_body, channel, target):
+    """通过 openclaw CLI 发送消息到指定渠道和目标."""
+    import subprocess, shutil
+
+    # 构造消息内容
+    message = f"📅 {subject}\n\n{plain_body}"
+
+    # 查找 openclaw 命令
+    openclaw_bin = shutil.which("openclaw")
+    if not openclaw_bin:
+        # 常见安装路径 fallback
+        for candidate in [
+            "/usr/local/bin/openclaw",
+            os.path.expanduser("~/.nvm/versions/node/v22.22.0/bin/openclaw"),
+        ]:
+            if os.path.isfile(candidate):
+                openclaw_bin = candidate
+                break
+    if not openclaw_bin:
+        return False, "openclaw binary not found"
+
+    cmd = [openclaw_bin, "message", "send", "--channel", channel, "--target", target, "-m", message]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PATH": os.environ.get("PATH", "") + ":/usr/local/bin"}
+        )
+        # 过滤 [plugins] 日志行
+        stdout = "\n".join(ln for ln in result.stdout.splitlines() if not ln.startswith("[plugins]"))
+        stderr = "\n".join(ln for ln in result.stderr.splitlines() if not ln.startswith("[plugins]"))
+
+        if result.returncode == 0:
+            return True, f"openclaw [{channel}] ok"
+        else:
+            err_msg = stderr.strip() or stdout.strip() or f"exit code {result.returncode}"
+            return False, f"openclaw [{channel}] error: {err_msg[:200]}"
+    except subprocess.TimeoutExpired:
+        return False, f"openclaw [{channel}] timeout (30s)"
+    except Exception as e:
+        return False, f"openclaw [{channel}] error: {e}"
+
+
 def _push_macos(subject, body):
     """Native macOS notification via osascript (best-effort, no error if not macOS)."""
     if sys.platform != "darwin":
@@ -1895,6 +1956,8 @@ def cmd_notify(args):
                 display_channels.append(c)
             elif isinstance(c, dict) and c.get("type") == "hermes":
                 display_channels.append(f"hermes:{c['platform']}:{c.get('name', c.get('index', 0))}")
+            elif isinstance(c, dict) and c.get("type") == "openclaw":
+                display_channels.append(f"oc:{c['channel']}→{c['target']}")
             else:
                 display_channels.append(str(c))
         print(f"Configured channels: {display_channels}")
@@ -1913,6 +1976,11 @@ def cmd_notify(args):
                 ok, msg = _push_hermes_channel(subject, plain, platform, instances[idx])
             else:
                 ok, msg = False, f"hermes channel {platform}[{idx}] not found"
+        elif isinstance(ch, dict) and ch.get("type") == "openclaw":
+            channel = ch["channel"]
+            target = ch["target"]
+            ch_label = f"oc:{channel}"
+            ok, msg = _push_openclaw_channel(subject, plain, channel, target)
         elif isinstance(ch, str) and ch == "macos":
             ch_label = ch
             ok, msg = _push_macos(subject, plain)
@@ -1942,6 +2010,10 @@ def cmd_notify_setup(args):
     hermes = _discover_hermes_channels()
     from_hermes = getattr(args, "from_hermes", False)
 
+    # 发现 openclaw 已配置渠道
+    openclaw_channels = _discover_openclaw_channels()
+    from_openclaw = getattr(args, "from_openclaw", False)
+
     # 构建 hermes 渠道选项列表
     hermes_options = []  # [(display_key, platform, index, name)]
     for platform, instances in sorted(hermes.items()):
@@ -1950,11 +2022,25 @@ def cmd_notify_setup(args):
             display_key = f"{platform}:{name}"
             hermes_options.append((display_key, platform, idx, name))
 
+    # 构建 openclaw 渠道选项列表
+    openclaw_options = []  # [(display_key, channel_id)]
+    for ch_id, ch_cfg in sorted(openclaw_channels.items()):
+        display_key = f"oc:{ch_id}"
+        openclaw_options.append((display_key, ch_id))
+
     # Channels
     chosen = args.channels
     if not chosen:
         # 展示可用渠道
-        if from_hermes:
+        if from_openclaw:
+            # --from-openclaw: 仅展示 openclaw 渠道
+            if not openclaw_options:
+                print("❌ 未发现 openclaw 已配置渠道 (检查 ~/.openclaw/openclaw.json)")
+                sys.exit(1)
+            print("openclaw 已配置渠道:")
+            for i, (dk, ch_id) in enumerate(openclaw_options, 1):
+                print(f"  {i}. {dk:<20} - {ch_id} (openclaw)")
+        elif from_hermes:
             # --from-hermes: 仅展示 hermes 渠道
             if not hermes_options:
                 print("❌ 未发现 hermes 已配置渠道 (检查 ~/.qclaw-hermes/channel_directory.json)")
@@ -1963,20 +2049,29 @@ def cmd_notify_setup(args):
             for i, (dk, plat, idx, name) in enumerate(hermes_options, 1):
                 print(f"  {i}. {dk:<20} - {plat} (hermes)")
         else:
-            # 正常模式：内置 + hermes
+            # 正常模式：内置 + openclaw + hermes
             print("可用推送渠道:")
             print("  [内置]")
             print("    macos              - macOS 系统通知")
             print("    qqmail             - QQ 邮箱")
             print("    wecom_webhook      - 企微群机器人")
+            if openclaw_options:
+                print("  [openclaw 已配置]")
+                for dk, ch_id in openclaw_options:
+                    print(f"    {dk:<20} - {ch_id} (openclaw)")
             if hermes_options:
                 print("  [hermes 已配置]")
                 for dk, plat, idx, name in hermes_options:
                     print(f"    {dk:<20} - {plat} (hermes)")
             print()
 
-        prompt_msg = "启用哪些渠道？(用逗号分隔)" if not from_hermes else "启用哪些 hermes 渠道？(用逗号或序号分隔)"
-        default = "macos" if not from_hermes else ""
+        if from_openclaw:
+            prompt_msg = "启用哪些 openclaw 渠道？(用逗号或序号分隔)"
+        elif from_hermes:
+            prompt_msg = "启用哪些 hermes 渠道？(用逗号或序号分隔)"
+        else:
+            prompt_msg = "启用哪些渠道？(用逗号分隔)"
+        default = "macos" if (not from_hermes and not from_openclaw) else ""
         try:
             ans = input(f"{prompt_msg} [默认: {default}]: ").strip() if default else input(f"{prompt_msg}: ").strip()
         except EOFError:
@@ -1990,18 +2085,33 @@ def cmd_notify_setup(args):
     hermes_key_map = {dk: (plat, idx, name) for dk, plat, idx, name in hermes_options}
     # 也按序号建 map（仅 from_hermes 模式才可能用到）
     hermes_idx_map = {str(i): (plat, idx, name) for i, (dk, plat, idx, name) in enumerate(hermes_options, 1)}
+    # openclaw key map
+    openclaw_key_map = {dk: ch_id for dk, ch_id in openclaw_options}
+    # openclaw 序号 map（仅 from_openclaw 模式）
+    openclaw_idx_map = {str(i): ch_id for i, (dk, ch_id) in enumerate(openclaw_options, 1)}
 
     for c in chosen:
         if c in ("macos", "qqmail", "wecom_webhook"):
             final_channels.append(c)
+        elif c in openclaw_key_map:
+            # oc:feishu 格式
+            ch_id = openclaw_key_map[c]
+            final_channels.append({"type": "openclaw", "channel": ch_id, "target": ""})
+        elif c in openclaw_idx_map and from_openclaw:
+            ch_id = openclaw_idx_map[c]
+            final_channels.append({"type": "openclaw", "channel": ch_id, "target": ""})
+        elif c.startswith("oc:") and c[3:] in openclaw_channels:
+            # 直接输入 oc:feishu
+            ch_id = c[3:]
+            final_channels.append({"type": "openclaw", "channel": ch_id, "target": ""})
         elif c in hermes_key_map:
             plat, idx, name = hermes_key_map[c]
             final_channels.append({"type": "hermes", "platform": plat, "index": idx, "name": name})
-        elif c in hermes_idx_map:
+        elif c in hermes_idx_map and from_hermes:
             plat, idx, name = hermes_idx_map[c]
             final_channels.append({"type": "hermes", "platform": plat, "index": idx, "name": name})
         else:
-            # 尝试匹配 platform:name 模式
+            # 尝试匹配 platform:name 模式 (hermes)
             matched = False
             for dk, plat, idx, name in hermes_options:
                 if c == dk or c == plat:
@@ -2009,8 +2119,39 @@ def cmd_notify_setup(args):
                     matched = True
                     break
             if not matched:
-                print(f"⚠️ 未知渠道: {c}，跳过")
+                # 尝试匹配 openclaw channel id (无 oc: 前缀)
+                if c in openclaw_channels:
+                    final_channels.append({"type": "openclaw", "channel": c, "target": ""})
+                else:
+                    print(f"⚠️ 未知渠道: {c}，跳过")
 
+    if not final_channels:
+        print("❌ 未选择任何有效渠道")
+        sys.exit(1)
+
+    # 对 openclaw 渠道交互式询问 target
+    for ch in final_channels:
+        if isinstance(ch, dict) and ch.get("type") == "openclaw" and not ch.get("target"):
+            channel = ch["channel"]
+            # 根据渠道类型给出提示
+            if channel == "feishu":
+                hint = "user:openId 或 chat:chatId"
+            elif channel == "wecom":
+                hint = "userId 或 chatId"
+            else:
+                hint = "目标 ID"
+            try:
+                target = input(f"oc:{channel} 的推送目标 ({hint}): ").strip()
+            except EOFError:
+                target = ""
+            if not target:
+                print(f"⚠️ oc:{channel} 未指定推送目标，跳过")
+                ch["_skip"] = True
+            else:
+                ch["target"] = target
+
+    # 移除被标记跳过的渠道
+    final_channels = [ch for ch in final_channels if not (isinstance(ch, dict) and ch.get("_skip"))]
     if not final_channels:
         print("❌ 未选择任何有效渠道")
         sys.exit(1)
@@ -2054,6 +2195,8 @@ def cmd_notify_setup(args):
     for c in final_channels:
         if isinstance(c, str):
             display_channels.append(c)
+        elif isinstance(c, dict) and c.get("type") == "openclaw":
+            display_channels.append(f"oc:{c['channel']}→{c['target']}")
         elif isinstance(c, dict):
             display_channels.append(f"hermes:{c['platform']}:{c.get('name', c.get('index', 0))}")
     print(f"✅ 通知配置已保存到 {CONFIG_PATH}")
@@ -2113,6 +2256,8 @@ def cmd_notify_status(args):
                 display_channels.append(c)
             elif isinstance(c, dict) and c.get("type") == "hermes":
                 display_channels.append(f"hermes:{c['platform']}:{c.get('name', c.get('index', 0))}")
+            elif isinstance(c, dict) and c.get("type") == "openclaw":
+                display_channels.append(f"oc:{c['channel']}→{c['target']}")
             else:
                 display_channels.append(str(c))
         print(f"   启用渠道: {', '.join(display_channels)}")
@@ -2124,6 +2269,13 @@ def cmd_notify_status(args):
             url = wb.get("url", "")
             masked = url[:40] + "..." if len(url) > 43 else url
             print(f"   企微 webhook: {masked or '(未配置)'}")
+        # openclaw 渠道详情
+        openclaw_chs = [c for c in channels if isinstance(c, dict) and c.get("type") == "openclaw"]
+        if openclaw_chs:
+            for oc in openclaw_chs:
+                ch = oc["channel"]
+                target = oc.get("target", "")
+                print(f"   openclaw [{ch}]: target={target}")
         # hermes 渠道详情
         hermes_chs = [c for c in channels if isinstance(c, dict) and c.get("type") == "hermes"]
         if hermes_chs:
@@ -2233,9 +2385,10 @@ def main():
     p_notify.add_argument("--sync-first", action="store_true", help="推送前先 sync 一次（cron 用）")
     p_notify.add_argument("--dry-run", action="store_true", help="只打印消息，不真的发送")
 
-    p_notify_setup = subparsers.add_parser("notify-setup", help="配置每日推送渠道（macos / qqmail / wecom_webhook / hermes）")
-    p_notify_setup.add_argument("--channels", nargs="+", help="启用的渠道，例: macos qqmail wecom_webhook dingtalk:群名")
+    p_notify_setup = subparsers.add_parser("notify-setup", help="配置每日推送渠道（macos / qqmail / wecom_webhook / openclaw / hermes）")
+    p_notify_setup.add_argument("--channels", nargs="+", help="启用的渠道，例: macos qqmail wecom_webhook oc:feishu dingtalk:群名")
     p_notify_setup.add_argument("--from-hermes", action="store_true", help="仅列出 hermes 已配置渠道，快速选择")
+    p_notify_setup.add_argument("--from-openclaw", action="store_true", help="仅列出 openclaw 已配置渠道，快速选择")
     p_notify_setup.add_argument("--qq-user", help="QQ 邮箱地址")
     p_notify_setup.add_argument("--qq-pass", help="QQ 邮箱授权码（非登录密码）")
     p_notify_setup.add_argument("--qq-to", help="收件人，默认发给自己")
